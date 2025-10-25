@@ -1,0 +1,591 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Flashy Fish — WebGPU (Fixed)</title>
+  <style>
+    html, body {
+      margin: 0; height: 100%; overflow: hidden !important;
+      /* Page background image behind the transparent canvas */
+      background-image:
+        url('background.jpg'),
+        url('background.jpeg');
+      background-size: cover;
+      background-position: center;
+      background-repeat: no-repeat;
+      font-family: system-ui, Arial, sans-serif;
+    }
+    /* WebGPU draws into this canvas; keep it full-screen and transparent */
+    canvas { width: 100%; height: 100%; display: block; background: transparent; }
+
+    /* Simple HUD labels in the corners */
+    #timeHud, #scoreHud {
+      position: fixed; top: 12px; font-size: 18px; color: #fff;
+      text-shadow: 0 1px 3px rgba(0,0,0,.85); user-select: none; pointer-events: none;
+    }
+    #timeHud{ left: 16px }  /* time on the left */
+    #scoreHud{ right: 16px }/* score on the right */
+
+    /* Title and end overlays sit above everything */
+    #title, #banner {
+      position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
+      color: #fff; text-shadow: 0 2px 8px rgba(0,0,0,.9);
+      background: rgba(0,0,0,.35); text-align: center; padding: 24px;
+    }
+    #title .card {
+      background: rgba(0,0,0,.35); border-radius: 16px; padding: 24px 28px;
+      box-shadow: 0 10px 30px rgba(0,0,0,.35); max-width: 680px;
+    }
+    #title h1{ margin:0 0 8px; font-size:42px }
+    #title p{ margin:8px 0; font-size:18px; line-height:1.4 }
+    #title .start{
+      display:inline-block; margin-top:16px; padding:10px 16px; cursor:pointer;
+      background:rgba(255,255,255,.12); border:1px solid rgba(255,255,255,.35);
+      border-radius:10px; font-size:18px; user-select:none
+    }
+    #title .start:hover{ background:rgba(255,255,255,.2) }
+    #banner{ font-size:48px } #banner small{ display:block; font-size:18px; margin-top:8px; opacity:.9 }
+  </style>
+</head>
+<body>
+  <!-- Transparent canvas; the ocean background is the page itself -->
+  <canvas id="c"></canvas>
+
+  <!-- HUD text -->
+  <div id="timeHud">Time: <span id="time">60.0</span>s</div>
+  <div id="scoreHud">Fish eaten: <span id="score">0</span>/<span id="target">30</span></div>
+
+  <!-- Title screen -->
+  <div id="title">
+    <div class="card">
+      <h1>Flashy Fish (WebGPU)</h1>
+      <p>Swim around and <b>eat the small fish</b> to score points.</p>
+      <p><b>Avoid the bombs</b> — hitting one ends the game.</p>
+      <p><b>Move:</b> WASD / Arrows ・ <b>Boost:</b> Shift</p>
+      <p><b>Goal:</b> Eat <span id="title-target">30</span> fish before time runs out.</p>
+      <div class="start" id="startBtn">Click to Start</div>
+      <small>(or press Space / Enter)</small>
+    </div>
+  </div>
+
+  <!-- End-of-game banner -->
+  <div id="banner"><span id="banner-text">Game Over</span><small>Press R to restart</small></div>
+
+<script type="module">
+/* =========================
+   Basic game constants/state
+   ========================= */
+const TARGET_SCORE=30, TIME_TOTAL=60.0, TIME_BONUS=2.0;
+const NUM_FISH=35, BOMB_COUNT=6;              // counts for small fish and bombs
+const clampMinX=-0.92, clampMaxX=0.92;        // screen clamp for player
+const clampMinY=-0.92, clampMaxY=0.92;
+const playerRadius=0.12;                       // player collision radius
+
+/* DOM references for HUD/overlays */
+const canvas=document.getElementById('c');
+const timeEl=document.getElementById('time');
+const scoreEl=document.getElementById('score');
+const targetEl=document.getElementById('target');
+const titleEl=document.getElementById('title');
+const titleTargetEl=document.getElementById('title-target');
+const startBtn=document.getElementById('startBtn');
+const bannerEl=document.getElementById('banner');
+const bannerTextEl=document.getElementById('banner-text');
+targetEl.textContent=TARGET_SCORE; titleTargetEl.textContent=TARGET_SCORE;
+
+/* Game phase and counters */
+let gameState='title', score=0, startTimeMs=0, frozenTimeLeft=null;
+
+/* =================
+   Keyboard handling
+   ================= */
+const keysDown={};
+addEventListener('keydown',e=>{
+  const k=e.key.toLowerCase();
+  keysDown[k]=true;
+  if((k===' '||k==='enter')&&gameState==='title') startGame();      // start from title
+  if(k==='r'&&(gameState==='playing'||gameState==='ended')) restartGame(); // restart anytime
+});
+addEventListener('keyup',e=>{ keysDown[e.key.toLowerCase()]=false; });
+startBtn.addEventListener('click', startGame);
+
+/* =====
+   Audio
+   =====
+   Small helper beeps for eat/explode feedback */
+let audioCtx=null;
+function ensureAudio(){ if(!audioCtx) audioCtx=new (window.AudioContext||window.webkitAudioContext)(); }
+addEventListener('keydown',()=>ensureAudio(),{once:true});
+addEventListener('pointerdown',()=>ensureAudio(),{once:true});
+function beep(freq=880,dur=0.12,type='sine',vol=0.25){
+  if(!audioCtx) return;
+  const t0=audioCtx.currentTime,osc=audioCtx.createOscillator(),gain=audioCtx.createGain();
+  osc.type=type; osc.frequency.setValueAtTime(freq,t0);
+  gain.gain.setValueAtTime(0,t0);
+  gain.gain.linearRampToValueAtTime(vol,t0+0.01);
+  gain.gain.linearRampToValueAtTime(0,t0+dur);
+  osc.connect(gain).connect(audioCtx.destination);
+  osc.start(t0); osc.stop(t0+dur+0.02);
+}
+function eatSound(){ beep(1100,0.07,'sine',0.35); setTimeout(()=>beep(1600,0.06,'sine',0.28),50); }
+function bombSound(){ beep(240,0.22,'square',0.4); }
+
+/* =================
+   WebGPU setup/init
+   ================= */
+if(!('gpu' in navigator)){
+  document.body.innerHTML="<div style='color:white;background:#000;padding:20px;font:16px monospace'>WebGPU not supported. Use Chrome/Edge (latest). If needed enable chrome://flags/#enable-unsafe-webgpu</div>";
+  throw new Error('WebGPU not supported');
+}
+const adapter=await navigator.gpu.requestAdapter();
+const device=await adapter.requestDevice();
+const context=canvas.getContext('webgpu');
+const format=navigator.gpu.getPreferredCanvasFormat();
+
+/* Match canvas size to the window and allow transparent rendering
+   so the CSS background shows through */
+function configure(){
+  const dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+  canvas.width  = Math.floor(innerWidth  * dpr);
+  canvas.height = Math.floor(innerHeight * dpr);
+  context.configure({ device, format, alphaMode:'premultiplied' });
+}
+configure();
+addEventListener('resize', configure);
+
+/* ==================
+   Geometry buffers
+   ==================
+   Fish is a small triangle mesh; bombs/eyes are textured circles via a quad. */
+// fish body vertices (simple 2D "fish" shape)
+const fishVerts=new Float32Array([
+  0.5,0.0,0.0,  0.2,0.25,0.0,  -0.2,0.15,0.0,  -0.4,0.3,0.0,
+  -0.4,-0.3,0.0, -0.2,-0.15,0.0,  0.2,-0.25,0.0
+]);
+// indices that form 5 triangles (we store 16, draw 15 to keep alignment simple)
+const fishIdx=new Uint16Array([0,1,6, 1,2,6, 2,5,6, 2,3,5, 3,4,5, 0]);
+
+const fishVB=device.createBuffer({size:fishVerts.byteLength,usage:GPUBufferUsage.VERTEX|GPUBufferUsage.COPY_DST});
+device.queue.writeBuffer(fishVB,0,fishVerts);
+const fishIB=device.createBuffer({size:fishIdx.byteLength,usage:GPUBufferUsage.INDEX|GPUBufferUsage.COPY_DST});
+device.queue.writeBuffer(fishIB,0,fishIdx);
+
+// a unit quad for eyes/bombs (fragment shader makes it circular)
+const quad=new Float32Array([ -0.5,-0.5,0,0,  0.5,-0.5,1,0,  0.5,0.5,1,1,  -0.5,0.5,0,1 ]);
+const quadIdx=new Uint16Array([0,1,2, 0,2,3]);
+const quadVB=device.createBuffer({size:quad.byteLength,usage:GPUBufferUsage.VERTEX|GPUBufferUsage.COPY_DST});
+device.queue.writeBuffer(quadVB,0,quad);
+const quadIB=device.createBuffer({size:quadIdx.byteLength,usage:GPUBufferUsage.INDEX|GPUBufferUsage.COPY_DST});
+device.queue.writeBuffer(quadIB,0,quadIdx);
+
+/* ==========================
+   Shaders + render pipelines
+   ==========================
+   One pipeline for fish mesh, one for circular sprites. */
+const fishShader=device.createShaderModule({code:/*wgsl*/`
+struct UFish { transform: mat4x4<f32>, color: vec4<f32> };
+@group(0) @binding(0) var<uniform> U : UFish;
+
+struct VSOut { @builtin(position) pos: vec4<f32> };
+
+@vertex fn vs(@location(0) pos: vec3<f32>) -> VSOut {
+  var o:VSOut;
+  o.pos = U.transform * vec4<f32>(pos,1.0);
+  return o;
+}
+
+@fragment fn fs() -> @location(0) vec4<f32> {
+  return U.color; // solid color from CPU (can include alpha)
+}
+`});
+
+const fishPipeline=device.createRenderPipeline({
+  layout:'auto',
+  vertex:{
+    module:fishShader, entryPoint:'vs',
+    buffers:[{arrayStride:12, attributes:[{shaderLocation:0, offset:0, format:'float32x3'}]}]
+  },
+  fragment:{
+    module:fishShader, entryPoint:'fs',
+    targets:[{ format }]
+  },
+  primitive:{topology:'triangle-list', cullMode:'none'}
+});
+
+const spriteShader=device.createShaderModule({code:/*wgsl*/`
+/* mode<0.5 => eye (uses S.color), mode>=0.5 => bomb (procedural glow) */
+struct USprite { transform: mat4x4<f32>, color: vec4<f32>, mode: f32, time: f32, pad: vec2<f32> };
+@group(0) @binding(0) var<uniform> S : USprite;
+
+struct VSOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+
+@vertex fn vs(@location(0) pos: vec2<f32>, @location(1) uv: vec2<f32>) -> VSOut {
+  var o:VSOut;
+  o.pos = S.transform * vec4<f32>(pos,0.0,1.0);
+  o.uv = uv;
+  return o;
+}
+
+@fragment fn fs(in:VSOut) -> @location(0) vec4<f32> {
+  let p = in.uv*2.0 - vec2<f32>(1.0,1.0);
+  let r = length(p);
+  if (r > 1.0) { discard; }             // make the quad circular
+
+  if (S.mode < 0.5) {                   // simple eye
+    return S.color;
+  }
+
+  // bomb look: dark core + animated glow and rim
+  let glow = 0.50 + 0.50 * (0.5 + 0.5 * sin(S.time * 6.0));
+  let rim  = smoothstep(0.80, 1.00, r);
+  var base = vec3<f32>(0.10, 0.10, 0.10);
+  var col  = base + glow * vec3<f32>(0.35, 0.15, 0.35) * (1.0 - r);
+  col      = mix(col, vec3<f32>(1.0, 0.6, 1.0), rim*0.25);
+  return vec4<f32>(col, 1.0);
+}
+`});
+
+const spritePipeline=device.createRenderPipeline({
+  layout:'auto',
+  vertex:{
+    module:spriteShader, entryPoint:'vs',
+    buffers:[{arrayStride:16, attributes:[
+      {shaderLocation:0, offset:0, format:'float32x2'}, // position
+      {shaderLocation:1, offset:8, format:'float32x2'}  // uv
+    ]}]
+  },
+  fragment:{ module:spriteShader, entryPoint:'fs', targets:[{format}] },
+  primitive:{topology:'triangle-list', cullMode:'none'}
+});
+
+/* ============================================
+   Per-object uniform buffers + bind groups
+   ============================================
+   Each fish/bomb/eye gets its own tiny uniform buffer. */
+const SIZE_FISH_UB   = 96; // 64 (mat4) + 16 (color) + 16 padding (alignment)
+const SIZE_SPRITE_UB = 96; // 64 (mat4) + 16 (color) + 16 (mode,time,pad)
+function makeUB(size){ return device.createBuffer({size, usage: GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST}); }
+
+/* One UB/BG for player + each small fish */
+const fishUBs=[], fishBGs=[];
+const fishBGL = fishPipeline.getBindGroupLayout(0);
+for(let i=0;i<NUM_FISH+1;i++){
+  const ub=makeUB(SIZE_FISH_UB); fishUBs.push(ub);
+  fishBGs.push(device.createBindGroup({layout:fishBGL, entries:[{binding:0, resource:{buffer:ub}}]}));
+}
+
+/* One UB/BG for each eye (player + fish) */
+const eyeUBs=[], eyeBGs=[];
+const spriteBGL = spritePipeline.getBindGroupLayout(0);
+for(let i=0;i<NUM_FISH+1;i++){
+  const ub=makeUB(SIZE_SPRITE_UB); eyeUBs.push(ub);
+  eyeBGs.push(device.createBindGroup({layout:spriteBGL, entries:[{binding:0, resource:{buffer:ub}}]}));
+}
+
+/* One UB/BG per bomb */
+const bombUBs=[], bombBGs=[];
+for(let i=0;i<BOMB_COUNT;i++){
+  const ub=makeUB(SIZE_SPRITE_UB); bombUBs.push(ub);
+  bombBGs.push(device.createBindGroup({layout:spriteBGL, entries:[{binding:0, resource:{buffer:ub}}]}));
+}
+
+/* ==========================
+   Minimal mat4 helpers (2D)
+   ==========================
+   Just scale + translate for positioning. */
+function mat4_mul(a,b){
+  const o=new Float32Array(16);
+  for(let c=0;c<4;c++){
+    for(let r=0;r<4;r++){
+      o[c*4+r]=a[0*4+r]*b[c*4+0]+a[1*4+r]*b[c*4+1]+a[2*4+r]*b[c*4+2]+a[3*4+r]*b[c*4+3];
+    }
+  }
+  return o;
+}
+function mat4_scale(sx,sy,sz){return new Float32Array([sx,0,0,0, 0,sy,0,0, 0,0,sz,0, 0,0,0,1]);}
+function mat4_translate(tx,ty,tz){return new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, tx,ty,tz,1]);}
+function makeTRS(tx,ty,sx,sy,dir){ const S=mat4_scale(dir*sx, sy, 1); const T=mat4_translate(tx,ty,0); return mat4_mul(T,S); }
+
+/* ==========
+   Game data
+   ==========
+   Arrays of fish and bombs + a simple RNG. */
+function rand(min,max){return min+Math.random()*(max-min);}
+const fish=[];            // all small fish objects
+let player={x:0,y:0,dir:-1,scale:1}; // player is a larger fish
+const bombs=[];
+
+function seedFish(){
+  /* Fill the fish array with random positions/directions/sizes/colors */
+  fish.length=0;
+  for(let i=0;i<NUM_FISH;i++){
+    fish.push({
+      x:rand(-0.9,0.9),
+      y:rand(-0.9,0.9),
+      dir:Math.random()<0.5?-1:1,      // left/right
+      scale:rand(0.10,0.20),
+      color:[Math.random(),Math.random(),Math.random(),1.0] // RGBA
+    });
+  }
+  player={x:0,y:0,dir:-1,scale:1};
+}
+
+function initBombs(){
+  /* Spawn bombs just off-screen on left or right so they drift across */
+  bombs.length=0;
+  for(let i=0;i<BOMB_COUNT;i++){
+    const dir=Math.random()<0.5?1:-1;
+    bombs.push({
+      x:dir===1?-1.10:1.10,
+      y:rand(-0.9,0.9),
+      dir,
+      size:rand(0.30,0.42),          // base scale for drawing
+      speed:rand(0.010,0.016),       // how fast it moves sideways
+      phase:Math.random()*100.0      // phase offset for vertical wiggle
+    });
+  }
+}
+seedFish();
+initBombs();
+
+/* ======================
+   Simple state utilities
+   ====================== */
+function timeLeft(){
+  if(gameState==='title') return TIME_TOTAL;
+  if(gameState==='ended'&&frozenTimeLeft!=null) return frozenTimeLeft;
+  return Math.max(0, TIME_TOTAL - (performance.now()-startTimeMs)/1000.0);
+}
+function startGame(){
+  if(gameState!=='title')return;
+  score=0; scoreEl.textContent=score;
+  frozenTimeLeft=null;
+  bannerEl.style.display='none';
+  titleEl.style.display='none';
+  startTimeMs=performance.now();
+  gameState='playing';
+}
+function restartGame(){
+  /* Reset everything and drop back into gameplay immediately */
+  seedFish(); initBombs();
+  score=0; scoreEl.textContent=score;
+  frozenTimeLeft=null;
+  bannerEl.style.display='none';
+  titleEl.style.display='none';
+  startTimeMs=performance.now();
+  gameState='playing';
+}
+function endGame(msg){
+  /* Freeze the timer and show the banner */
+  if(gameState!=='playing')return;
+  frozenTimeLeft=timeLeft();
+  bannerTextEl.textContent=msg;
+  bannerEl.style.display='flex';
+  gameState='ended';
+}
+function clampPlayer(){
+  /* Keep the player inside the visible area */
+  player.x=Math.max(clampMinX,Math.min(clampMaxX,player.x));
+  player.y=Math.max(clampMinY,Math.min(clampMaxY,player.y));
+}
+
+/* ============================
+   Uniform buffer write helpers
+   ============================ */
+function writeFishUB(buf, M, color){
+  /* Pack (mat4 + color) into a 96-byte aligned block */
+  const padded = new Float32Array(24);
+  padded.set(M, 0);
+  padded.set(color, 16);
+  device.queue.writeBuffer(buf, 0, padded);
+}
+function writeSpriteUB(buf, M, color, mode, time){
+  /* Pack (mat4 + color + mode/time) into 96 bytes */
+  const padded = new Float32Array(24);
+  padded.set(M, 0);
+  padded.set(color, 16);
+  padded.set([mode, time, 0, 0], 20);
+  device.queue.writeBuffer(buf, 0, padded);
+}
+
+/* ==============================
+   Cached vertex buffer descriptors
+   ============================== */
+const fishVBDesc = { slot:0, buffer: fishVB, idx: fishIB, idxFmt: 'uint16' };
+const quadVBDesc = { slot:0, buffer: quadVB, idx: quadIB, idxFmt: 'uint16' };
+
+/* ===============
+   Main game loop
+   =============== */
+const baseSpeed=0.012, boostMult=2.0; // movement speed knobs
+const fishVX=0.008;                   // base sideways speed for small fish
+
+titleEl.style.display='flex';         // open on the title
+timeEl.textContent=TIME_TOTAL.toFixed(1);
+
+function frame(){
+  requestAnimationFrame(frame);
+
+  /* ----- Timer and win/lose checks ----- */
+  const tleft=timeLeft();
+  timeEl.textContent=tleft.toFixed(1);
+  if(gameState==='playing' && tleft<=0) endGame('Time Up!');
+  if(gameState==='playing' && score>=TARGET_SCORE) endGame('You Win!');
+
+  /* ----- Player movement (WASD/Arrows, Shift boost) ----- */
+  if(gameState==='playing'){
+    let dx=0,dy=0;
+    if(keysDown['arrowleft']||keysDown['a']) dx-=1;
+    if(keysDown['arrowright']||keysDown['d']) dx+=1;
+    if(keysDown['arrowup']||keysDown['w']) dy+=1;
+    if(keysDown['arrowdown']||keysDown['s']) dy-=1;
+    if(dx||dy){
+      const len=Math.hypot(dx,dy); dx/=len; dy/=len;
+      const sp=baseSpeed*(keysDown['shift']?boostMult:1);
+      player.x+=dx*sp; player.y+=dy*sp;
+      player.dir=(dx>=0)?1:-1; // flip based on horizontal input
+    }
+    clampPlayer();
+  }
+
+  /* ----- Small fish AI + collisions + respawn ----- */
+  if(gameState==='playing'){
+    for(const f of fish){
+      // drift sideways and wiggle a bit vertically
+      f.x+=fishVX*f.dir;
+      f.y+=0.04*(Math.random()-0.5);
+
+      // wrap around edges and re-roll color/scale
+      const margin=0.06;
+      if(f.dir===1 && f.x>1+margin){
+        f.x=-1.05+(Math.random()*0.08-0.04); f.y=rand(-0.9,0.9); f.dir=1;
+        f.color=[Math.random(),Math.random(),Math.random(),1.0];
+        f.scale=rand(0.10,0.20);
+      } else if(f.dir===-1 && f.x<-1-margin){
+        f.x= 1.05+(Math.random()*0.08-0.04); f.y=rand(-0.9,0.9); f.dir=-1;
+        f.color=[Math.random(),Math.random(),Math.random(),1.0];
+        f.scale=rand(0.10,0.20);
+      }
+
+      // check if the player "eats" this fish
+      const dx=player.x-f.x, dy=player.y-f.y, fishR=0.09*f.scale;
+      if((dx*dx+dy*dy) <= (playerRadius+fishR)*(playerRadius+fishR)){
+        score++; scoreEl.textContent=score;
+        eatSound();
+        startTimeMs -= TIME_BONUS*1000.0; // add time by shifting the start
+        // respawn on the side the player is facing
+        if(player.dir===1){ f.x=-1.05+(Math.random()*0.08-0.04); f.y=rand(-0.9,0.9); f.dir=1; }
+        else               { f.x= 1.05+(Math.random()*0.08-0.04); f.y=rand(-0.9,0.9); f.dir=-1; }
+        f.color=[Math.random(),Math.random(),Math.random(),1.0];
+        f.scale=rand(0.10,0.20);
+        if(score>=TARGET_SCORE) endGame('You Win!');
+      }
+    }
+  }
+
+  /* ----- Bomb motion + collisions ----- */
+  const timeSec=performance.now()*0.001;
+  if(gameState==='playing'){
+    for(const b of bombs){
+      // slide sideways and gently bob up/down
+      b.x+=b.dir*b.speed;
+      b.y+=0.018*Math.sin((timeSec+b.phase)*3.0);
+      // wrap around horizontally
+      if(b.dir===1 && b.x>1.12){ b.x=-1.12+(Math.random()*0.06-0.03); b.y=rand(-0.9,0.9); }
+      else if(b.dir===-1 && b.x<-1.12){ b.x=1.12+(Math.random()*0.06-0.03); b.y=rand(-0.9,0.9); }
+      // collision with player ends the game
+      const dx=player.x-b.x, dy=player.y-b.y, bombR=0.18*b.size;
+      if((dx*dx+dy*dy) <= (playerRadius+bombR)*(playerRadius+bombR)){
+        bombSound(); endGame('Game Over'); break;
+      }
+    }
+  }
+
+  /* ======================
+     Encode and draw frame
+     ====================== */
+  const encoder=device.createCommandEncoder();
+  const view=context.getCurrentTexture().createView();
+  const pass=encoder.beginRenderPass({
+    colorAttachments:[{
+      view,
+      clearValue:{r:0,g:0,b:0,a:0}, // keep canvas transparent
+      loadOp:'clear', storeOp:'store'
+    }]
+  });
+
+  /* --- Player (big red fish) --- */
+  {
+    const M = makeTRS(player.x,player.y,player.scale,player.scale,player.dir);
+    const color = [1,0,0,1.0]; // solid red body
+    writeFishUB(fishUBs[0], M, color);
+
+    pass.setPipeline(fishPipeline);
+    pass.setVertexBuffer(0, fishVBDesc.buffer);
+    pass.setIndexBuffer(fishVBDesc.idx, fishVBDesc.idxFmt);
+    pass.setBindGroup(0, fishBGs[0]);
+    pass.drawIndexed(15);
+
+    // player eye (single circular sprite)
+    const eyeS = 0.08 * player.scale;
+    const ex=0.2, ey=(player.dir===-1?-0.2:0.2);
+    const EM = makeTRS(player.x+ex*player.scale*player.dir, player.y+ey*player.scale, eyeS, eyeS, 1);
+    writeSpriteUB(eyeUBs[0], EM, [0,0,0,1], 0.0, timeSec);
+
+    pass.setPipeline(spritePipeline);
+    pass.setVertexBuffer(0, quadVBDesc.buffer);
+    pass.setIndexBuffer(quadVBDesc.idx, quadVBDesc.idxFmt);
+    pass.setBindGroup(0, eyeBGs[0]);
+    pass.drawIndexed(6);
+  }
+
+  /* --- Small fish (mesh + tiny eye sprite) --- */
+  for(let i=0;i<fish.length;i++){
+    const f=fish[i];
+    const M = makeTRS(f.x,f.y,f.scale,f.scale,f.dir);
+    writeFishUB(fishUBs[i+1], M, f.color);
+
+    pass.setPipeline(fishPipeline);
+    pass.setVertexBuffer(0, fishVBDesc.buffer);
+    pass.setIndexBuffer(fishVBDesc.idx, fishVBDesc.idxFmt);
+    pass.setBindGroup(0, fishBGs[i+1]);
+    pass.drawIndexed(15);
+
+    // small eye; uses fish scale so it stays tiny
+    const eyeS= 0.01 * player.scale; // (can switch to 0.06 * f.scale if desired)
+    const ex=0.2, ey=(f.dir===-1?-0.2:0.2);
+    const EM = makeTRS(f.x+ex*f.scale*f.dir, f.y+ey*f.scale, eyeS, eyeS, 1);
+    writeSpriteUB(eyeUBs[i+1], EM, [0,0,0,1], 0.0, timeSec);
+
+    pass.setPipeline(spritePipeline);
+    pass.setVertexBuffer(0, quadVBDesc.buffer);
+    pass.setIndexBuffer(quadVBDesc.idx, quadVBDesc.idxFmt);
+    pass.setBindGroup(0, eyeBGs[i+1]);
+    pass.drawIndexed(6);
+  }
+
+  /* --- Bomb sprites --- */
+  for(let i=0;i<bombs.length;i++){
+    const b=bombs[i];
+    const size=Math.max(0.1,0.20*b.size);  // overall draw size
+    const BM = makeTRS(b.x,b.y,size,size,1);
+    writeSpriteUB(bombUBs[i], BM, [0,0,0,1], 1.0, timeSec); // mode=1 => bomb
+
+    pass.setPipeline(spritePipeline);
+    pass.setVertexBuffer(0, quadVBDesc.buffer);
+    pass.setIndexBuffer(quadVBDesc.idx, quadVBDesc.idxFmt);
+    pass.setBindGroup(0, bombBGs[i]);
+    pass.drawIndexed(6);
+  }
+
+  pass.end();
+  device.queue.submit([encoder.finish()]);
+}
+
+/* Kick off the render loop and show the title */
+requestAnimationFrame(frame);
+titleEl.style.display='flex';
+timeEl.textContent=TIME_TOTAL.toFixed(1);
+</script>
+</body>
+</html>
